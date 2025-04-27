@@ -28,4 +28,4 @@ Works with any G-code file regardless of which slicer generated it
 Change the path to python and to the script file to your own.
 Find it via cmd -> where python
 
-"C:\Users\...\AppData\Local\Programs\Python\Python313\python.exe" "E:\...\modify_speeds.py" -minSpeed 85 -maxSpeed 100
+"C:\Users\...\AppData\Local\Programs\Python\Python313\python.exe" "E:\...\modify_speeds.py" -min 90 -max 110;
