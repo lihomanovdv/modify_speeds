@@ -14,189 +14,169 @@
 # ADDITIONAL TERMS: Commercial use of this software is explicitly prohibited.
 # This restriction applies to the original code and all derivatives.
 
-import re
-import sys
+#!/usr/bin/env python3
+import argparse
 import logging
 import os
-import argparse
+import re
 import math
+import datetime
+import sys
+from typing import Tuple, List, Optional
 
-# Get the directory where the script is located
+# Script setup
 script_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Configure logging to save in the script's directory
-log_file_path = os.path.join(script_dir, "speed_modifier_log.txt")
+log_file_path = os.path.join(script_dir, 'y_speed_range_avoidance_log.txt')
 logging.basicConfig(
-    filename=log_file_path,
-    filemode="w",
+    filename=log_file_path, 
     level=logging.INFO,
-    format="%(asctime)s - %(message)s"
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-def calculate_y_component(dx, dy, f):
-    """
-    Calculate the Y component of speed for a movement.
+def parse_g1_command(line: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Parse G1 command to extract X, Y, Z, E, and F parameters."""
+    x = re.search(r'X([-+]?\d*\.?\d+)', line)
+    y = re.search(r'Y([-+]?\d*\.?\d+)', line)
+    z = re.search(r'Z([-+]?\d*\.?\d+)', line)
+    e = re.search(r'E([-+]?\d*\.?\d+)', line)
+    f = re.search(r'F([-+]?\d*\.?\d+)', line)
     
-    Args:
-        dx (float): X distance of movement
-        dy (float): Y distance of movement
-        f (float): Total speed (F value) in mm/min
-        
-    Returns:
-        float: Y component of speed in mm/s
-    """
+    return (
+        float(x.group(1)) if x else None,
+        float(y.group(1)) if y else None,
+        float(z.group(1)) if z else None,
+        float(e.group(1)) if e else None,
+        float(f.group(1)) if f else None
+    )
+
+def calculate_y_component_speed(dx: float, dy: float, speed: float) -> float:
+    """Calculate Y component of a diagonal move's speed."""
     if dx == 0 and dy == 0:
         return 0
     
-    total_distance = math.sqrt(dx**2 + dy**2)
-    if total_distance == 0:
+    move_distance = math.sqrt(dx**2 + dy**2)
+    if move_distance == 0:
         return 0
-    
-    # Calculate ratio of Y movement to total movement
-    y_ratio = abs(dy) / total_distance
-    
-    # Convert F from mm/min to mm/s and calculate Y component
-    f_mm_s = f / 60
-    y_speed = f_mm_s * y_ratio
+        
+    y_proportion = abs(dy) / move_distance
+    y_speed = speed * y_proportion
     
     return y_speed
 
-def get_adjusted_speed(current_y_speed, min_speed, max_speed, current_f):
-    """
-    Determine the new speed to avoid the resonance range.
-    Chooses the closest boundary: below min_speed or above max_speed.
+def adjust_speed_outside_range(speed: float, min_range: float, max_range: float) -> float:
+    """Adjust speed to be outside the specified range."""
+    if speed < min_range or speed > max_range:
+        return speed  # Already outside range
     
-    Args:
-        current_y_speed (float): Current Y component speed in mm/s
-        min_speed (float): Minimum Y speed to avoid (mm/s)
-        max_speed (float): Maximum Y speed to avoid (mm/s)
-        current_f (float): Current total speed in mm/min
-        
-    Returns:
-        float: New adjusted speed in mm/min
-    """
     # Calculate distance to each boundary
-    distance_to_min = current_y_speed - min_speed
-    distance_to_max = max_speed - current_y_speed
+    dist_to_min = speed - min_range
+    dist_to_max = max_range - speed
     
-    # Determine which boundary is closer
-    if distance_to_min <= distance_to_max:
-        # Closer to min_speed, so go just below it
-        adjustment_factor = (min_speed - 0.1) / current_y_speed
+    # Adjust to nearest boundary
+    if dist_to_min <= dist_to_max:
+        return min_range - 1  # Go below minimum
     else:
-        # Closer to max_speed, so go just above it
-        adjustment_factor = (max_speed + 0.1) / current_y_speed
-    
-    # Apply adjustment to the total speed
-    new_f = current_f * adjustment_factor
-    
-    return new_f
+        return max_range + 1  # Go above maximum
 
-def modify_speeds(input_file, min_speed, max_speed):
-    """
-    Modifies G-code by replacing speeds that would result in Y-axis speeds
-    within the specified range, with a speed just below or above the range.
+def adjust_extrusion_for_speed_change(e_value: float, original_speed: float, new_speed: float) -> float:
+    """Adjust extrusion amount based on speed change."""
+    if original_speed == 0:
+        return e_value
     
-    Args:
-        input_file (str): Path to the G-code file.
-        min_speed (float): Minimum Y speed to avoid (mm/s).
-        max_speed (float): Maximum Y speed to avoid (mm/s).
-    """
-    logging.info(f"Starting G-code speed modification")
-    logging.info(f"Input file: {input_file}")
-    logging.info(f"Y-speed range to avoid: {min_speed} - {max_speed} mm/s")
+    ratio = original_speed / new_speed
+    return e_value * ratio
+
+def process_gcode(input_file: str, min_range: float, max_range: float) -> None:
+    """Process the G-code file to avoid Y speeds in the specified range."""
+    logging.info(f'Processing file: {input_file}')
+    logging.info(f'Avoiding Y speeds between {min_range} and {max_range} mm/s')
     
-    changes_count = 0
+    # Variables to track state
+    last_x, last_y = 0.0, 0.0
+    last_speed = 0.0
+    modifications_count = 0
     
-    # Read the input G-code
-    with open(input_file, 'r') as infile:
-        lines = infile.readlines()
-    
-    # Process the G-code
-    modified_lines = []
-    
-    # Keep track of current position and speed
-    current_x = 0.0
-    current_y = 0.0
-    current_f = 0.0
-    
-    for line in lines:
-        original_line = line.strip()
-        modified = False
+    try:
+        # Read all lines from the file
+        with open(input_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
         
-        # Look for G0/G1 movement commands
-        if line.strip().startswith(("G0 ", "G1 ")):
-            # Extract X, Y, and F values if present
-            x_match = re.search(r'X([-+]?\d*\.?\d+)', line)
-            y_match = re.search(r'Y([-+]?\d*\.?\d+)', line)
-            f_match = re.search(r'F([\d.]+)', line)
+        # Process lines and modify as needed
+        for i in range(len(lines)):
+            line = lines[i]
             
-            # Get new coordinates
-            new_x = float(x_match.group(1)) if x_match else current_x
-            new_y = float(y_match.group(1)) if y_match else current_y
-            
-            # Get speed (F value)
-            if f_match:
-                current_f = float(f_match.group(1))
-            
-            # Calculate movement deltas
-            dx = new_x - current_x
-            dy = new_y - current_y
-            
-            # If there's movement and we have a speed
-            if (dx != 0 or dy != 0) and current_f > 0:
-                # Calculate Y component of speed in mm/s
-                y_speed = calculate_y_component(dx, dy, current_f)
+            # Skip comments and non-movement commands
+            if not line.strip() or line.strip().startswith(';') or not line.strip().startswith('G1'):
+                continue
                 
-                # Check if Y speed is in the range to avoid
-                if min_speed <= y_speed <= max_speed:
-                    # Get adjusted speed
-                    original_f = current_f
-                    adjusted_f = get_adjusted_speed(y_speed, min_speed, max_speed, current_f)
-                    current_f = adjusted_f
-                    
-                    # Calculate new Y component for logging
-                    new_y_speed = calculate_y_component(dx, dy, adjusted_f)
-                    
-                    # Replace the F value in the line
-                    if f_match:
-                        line = re.sub(r'F[\d.]+', f'F{current_f:.2f}', line)
-                    else:
-                        line = line.strip() + f' F{current_f:.2f}\n'
-                    
-                    # Add a comment about the modification
-                    direction = "below" if new_y_speed < min_speed else "above"
-                    line = line.strip() + f" ; Y-speed modified from {y_speed:.2f} to {new_y_speed:.2f} mm/s ({direction} resonance range)\n"
-                    modified = True
-                    changes_count += 1
-                    logging.info(f"Changed speed from F{original_f:.2f} to F{current_f:.2f} (Y-component from {y_speed:.2f} to {new_y_speed:.2f} mm/s)")
+            x, y, z, e, f = parse_g1_command(line)
             
-            # Update current position
-            current_x = new_x
-            current_y = new_y
+            # Update speed if specified
+            if f is not None:
+                last_speed = f / 60  # Convert from mm/min to mm/s
+            
+            # Only process movement commands with Y component and speed
+            if y is not None and last_speed > 0:
+                dx = 0 if x is None else x - last_x
+                dy = y - last_y
+                
+                # Calculate Y component of speed
+                y_speed = calculate_y_component_speed(dx, dy, last_speed)
+                
+                # If Y speed is in the avoided range, adjust the overall speed
+                if min_range <= y_speed <= max_range:
+                    new_speed = adjust_speed_outside_range(y_speed, min_range, max_range)
+                    speed_ratio = new_speed / y_speed
+                    new_overall_speed = last_speed * speed_ratio
+                    
+                    # Adjust extrusion if present
+                    if e is not None:
+                        new_e = adjust_extrusion_for_speed_change(e, last_speed, new_overall_speed)
+                        e_str = f'E{new_e:.5f}'
+                        line = re.sub(r'E[-+]?\d*\.?\d+', e_str, line)
+                    
+                    # Update speed in the G-code
+                    new_f = new_overall_speed * 60  # Convert back to mm/min
+                    f_str = f'F{new_f:.1f}'
+                    
+                    if 'F' in line:
+                        line = re.sub(r'F[-+]?\d*\.?\d+', f_str, line)
+                    else:
+                        line = line.rstrip() + f' {f_str}\n'
+                    
+                    # Add comment about modification
+                    line = line.rstrip() + f' ; Y-speed adjusted from {y_speed:.2f} to {new_speed:.2f} mm/s\n'
+                    lines[i] = line
+                    
+                    modifications_count += 1
+                    logging.info(f'Line modified: Y-speed {y_speed:.2f} → {new_speed:.2f} mm/s')
+            
+            # Update position tracking
+            if x is not None:
+                last_x = x
+            if y is not None:
+                last_y = y
         
-        if not modified:
-            modified_lines.append(original_line + "\n")
-        else:
-            modified_lines.append(line)
-    
-    # Overwrite the input file with the modified G-code
-    with open(input_file, 'w') as outfile:
-        outfile.writelines(modified_lines)
-    
-    logging.info(f"G-code processing completed. {changes_count} speed changes made.")
-    logging.info(f"Log file saved at {log_file_path}")
+        # Write modified content back to file
+        with open(input_file, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+            
+        logging.info(f'Processing complete. Made {modifications_count} modifications.')
+        
+    except Exception as e:
+        logging.error(f'Error processing file: {str(e)}')
+        print(f'Error: {str(e)}')
+        sys.exit(1)
 
-# Main execution
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Modify print speeds in G-code files to avoid specific Y-axis speeds.")
-    parser.add_argument("input_file", help="Path to the input G-code file")
-    parser.add_argument("-minSpeed", type=float, default=90, help="Minimum Y speed to avoid (mm/s)")
-    parser.add_argument("-maxSpeed", type=float, default=100, help="Maximum Y speed to avoid (mm/s)")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Modify G-code to avoid specific Y-axis speed range')
+    parser.add_argument('input_file', help='Input G-code file')
+    parser.add_argument('-min', type=float, default=90, help='Minimum speed to avoid (mm/s)')
+    parser.add_argument('-max', type=float, default=110, help='Maximum speed to avoid (mm/s)')
+    
     args = parser.parse_args()
-
-    modify_speeds(
-        input_file=args.input_file,
-        min_speed=args.minSpeed,
-        max_speed=args.maxSpeed,
-    )
+    
+    logging.info('='*50)
+    logging.info(f'Script started at {datetime.datetime.now()}')
+    
+    process_gcode(args.input_file, args.min, args.max)
